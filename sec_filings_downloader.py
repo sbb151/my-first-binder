@@ -8,10 +8,19 @@ Usage:
     from sec_filings_downloader import SECFilingsProcessor
 
     processor = SECFilingsProcessor()
-    processor.process_filings(
+
+    # Download ALL filings from SEC quarterly index files
+    processor.process_all_filings_from_index(
         form_types=['10-K', '10-Q'],
         year=2023,
-        cik_list=['0000320193']  # Optional: specific companies
+        max_filings=100  # Optional limit
+    )
+
+    # Or download filings for specific companies
+    processor.process_filings(
+        form_types=['10-K'],
+        year=2023,
+        cik_list=['0000320193']  # Apple Inc.
     )
 """
 
@@ -137,6 +146,87 @@ class SECFilingsProcessor:
 
             except Exception as e:
                 print(f"Error fetching filings for CIK {cik}, form {form_type}: {e}")
+
+        return filings
+
+    def download_quarterly_index(self, year: int, quarter: int) -> Optional[str]:
+        """
+        Download the SEC quarterly index file for a given year and quarter.
+
+        Args:
+            year: Year of the index file
+            quarter: Quarter (1-4)
+
+        Returns:
+            Content of the index file as a string, or None if failed
+        """
+        # Index file URL format: https://www.sec.gov/Archives/edgar/full-index/2023/QTR4/company.idx
+        index_url = f"{self.BASE_URL}/Archives/edgar/full-index/{year}/QTR{quarter}/company.idx"
+
+        print(f"Downloading index for {year} Q{quarter}...")
+
+        try:
+            response = self.session.get(index_url, timeout=30)
+            response.raise_for_status()
+
+            # Decode the content
+            content = response.content.decode('latin-1')
+            print(f"  ✓ Successfully downloaded index ({len(content)} characters)")
+            return content
+
+        except Exception as e:
+            print(f"  ✗ Error downloading index for {year} Q{quarter}: {e}")
+            return None
+
+    def parse_index_file(self, index_content: str, form_types: List[str],
+                        year: int) -> List[dict]:
+        """
+        Parse the SEC quarterly index file to extract filings.
+
+        Args:
+            index_content: Content of the index file
+            form_types: List of form types to filter (e.g., ['10-K', '10-Q'])
+            year: Year to filter filings by filing date
+
+        Returns:
+            List of filing dictionaries
+        """
+        filings = []
+        lines = index_content.split('\n')
+
+        # Skip header lines (first 10 lines are headers)
+        for line_num, line in enumerate(lines):
+            if line_num < 10:
+                continue
+
+            # Use regex to parse the index line
+            # Format: Company Name  Form Type  CIK  Date Filed  File Name
+            # Elements are separated by 2 or more spaces
+            match = re.search(r'^(.+?)\s{2,}(.+?)\s{2,}(\d+)\s+(\d{4}-\d{2}-\d{2})\s+(\S+)', line)
+
+            if match:
+                company_name = match.group(1).strip()
+                form_type = match.group(2).strip()
+                cik = match.group(3).strip()
+                filing_date = match.group(4).strip()
+                file_path = match.group(5).strip()
+
+                # Check if form type matches
+                if form_type in form_types or any(form_type.startswith(ft) for ft in form_types):
+                    # Check if filing date is in the target year
+                    filing_year = int(filing_date.split('-')[0])
+
+                    if filing_year == year:
+                        # Construct the full URL to the filing
+                        filing_url = f"{self.BASE_URL}/Archives/{file_path}"
+
+                        filings.append({
+                            'company_name': company_name,
+                            'form_type': form_type,
+                            'cik': cik,
+                            'filing_date': filing_date,
+                            'url': filing_url
+                        })
 
         return filings
 
@@ -331,11 +421,133 @@ class SECFilingsProcessor:
             print(f"Error cleaning filing {input_path}: {e}")
             return False
 
+    def process_all_filings_from_index(self, form_types: List[str], year: int,
+                                       max_filings: Optional[int] = None,
+                                       quarters: Optional[List[int]] = None):
+        """
+        Download and clean ALL filings from SEC quarterly index files.
+        This method downloads the complete population of filings for the specified
+        form types and year.
+
+        Args:
+            form_types: List of form types (e.g., ['10-K', '10-Q'])
+            year: Year of filings to retrieve
+            max_filings: Optional maximum number of filings to process
+            quarters: Optional list of quarters to process (default: [1,2,3,4])
+        """
+        if quarters is None:
+            quarters = [1, 2, 3, 4]
+
+        print(f"\n{'='*60}")
+        print(f"SEC Filings Processor (Index-Based)")
+        print(f"{'='*60}")
+        print(f"Form types: {', '.join(form_types)}")
+        print(f"Year: {year}")
+        print(f"Quarters: {', '.join(map(str, quarters))}")
+        if max_filings:
+            print(f"Max filings: {max_filings}")
+        print(f"{'='*60}\n")
+
+        # Create folder structure
+        raw_folder, clean_folder = self.create_folders(year)
+
+        # Download and parse all quarterly index files
+        all_filings = []
+
+        for quarter in quarters:
+            index_content = self.download_quarterly_index(year, quarter)
+
+            if index_content:
+                filings = self.parse_index_file(index_content, form_types, year)
+                all_filings.extend(filings)
+                print(f"  Found {len(filings)} matching filings in Q{quarter}")
+
+            # Be respectful to SEC servers
+            time.sleep(0.2)
+
+        if not all_filings:
+            print("\nNo filings found matching the criteria.")
+            return
+
+        print(f"\n{'='*60}")
+        print(f"Total filings found: {len(all_filings)}")
+        print(f"{'='*60}\n")
+
+        # Limit number of filings if specified
+        if max_filings:
+            print(f"Limiting to {max_filings} filings as requested.\n")
+            all_filings = all_filings[:max_filings]
+
+        print(f"{'='*60}")
+        print(f"Downloading {len(all_filings)} filings...")
+        print(f"{'='*60}\n")
+
+        # Download filings
+        downloaded_files = []
+        for i, filing in enumerate(all_filings, 1):
+            # Create filename
+            cik = filing['cik']
+            form_type = filing['form_type'].replace('/', '_')
+            filing_date = filing['filing_date'].replace('-', '')
+            filename = f"{cik}_{form_type}_{filing_date}.html"
+
+            raw_path = raw_folder / filename
+
+            # Skip if already downloaded
+            if raw_path.exists():
+                print(f"[{i}/{len(all_filings)}] Skipping {filename} (already exists)")
+                downloaded_files.append((raw_path, filename))
+                continue
+
+            print(f"[{i}/{len(all_filings)}] Downloading {filename}...")
+
+            if self.download_filing(filing['url'], raw_path):
+                downloaded_files.append((raw_path, filename))
+                print(f"  ✓ Saved to {raw_path}")
+            else:
+                print(f"  ✗ Failed to download")
+
+            # Be respectful to SEC servers
+            time.sleep(0.15)
+
+        print(f"\n{'='*60}")
+        print(f"Cleaning {len(downloaded_files)} filings...")
+        print(f"{'='*60}\n")
+
+        # Clean filings
+        cleaned_count = 0
+        for i, (raw_path, filename) in enumerate(downloaded_files, 1):
+            clean_filename = filename.replace('.html', '.txt')
+            clean_path = clean_folder / clean_filename
+
+            # Skip if already cleaned
+            if clean_path.exists():
+                print(f"[{i}/{len(downloaded_files)}] Skipping {clean_filename} (already exists)")
+                cleaned_count += 1
+                continue
+
+            print(f"[{i}/{len(downloaded_files)}] Cleaning {filename}...")
+
+            if self.clean_filing(raw_path, clean_path):
+                cleaned_count += 1
+                print(f"  ✓ Saved to {clean_path}")
+            else:
+                print(f"  ✗ Failed to clean")
+
+        print(f"\n{'='*60}")
+        print(f"Processing Complete!")
+        print(f"{'='*60}")
+        print(f"Downloaded: {len(downloaded_files)} filings")
+        print(f"Cleaned: {cleaned_count} filings")
+        print(f"Raw files: {raw_folder}")
+        print(f"Clean files: {clean_folder}")
+        print(f"{'='*60}\n")
+
     def process_filings(self, form_types: List[str], year: int,
                        cik_list: Optional[List[str]] = None,
                        max_filings: Optional[int] = None):
         """
-        Main method to download and clean filings.
+        Main method to download and clean filings for specific companies.
 
         Args:
             form_types: List of form types (e.g., ['10-K', '10-Q'])
@@ -438,19 +650,28 @@ def main():
     """
     processor = SECFilingsProcessor()
 
-    # Example 1: Download 10-K filings for Apple (CIK: 0000320193) in 2023
+    # Example 1: Download ALL 10-K filings from 2023 using quarterly index files
+    # This will download the entire population of 10-K filings
+    processor.process_all_filings_from_index(
+        form_types=['10-K'],
+        year=2023,
+        max_filings=50  # Remove this parameter to download ALL filings
+    )
+
+    # Example 2: Download 10-K filings for specific companies
     # processor.process_filings(
     #     form_types=['10-K'],
     #     year=2023,
-    #     cik_list=['0000320193']
+    #     cik_list=['0000320193', '0000789019']  # Apple and Microsoft
     # )
 
-    # Example 2: Download first 10 10-K and 10-Q filings from 2023
-    processor.process_filings(
-        form_types=['10-K', '10-Q'],
-        year=2023,
-        max_filings=10
-    )
+    # Example 3: Download filings from specific quarters only
+    # processor.process_all_filings_from_index(
+    #     form_types=['10-Q'],
+    #     year=2023,
+    #     quarters=[1, 2],  # Only Q1 and Q2
+    #     max_filings=100
+    # )
 
 
 if __name__ == "__main__":
